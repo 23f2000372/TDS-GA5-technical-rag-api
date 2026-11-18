@@ -1,17 +1,17 @@
 
 import json
 import re
-
 import numpy as np
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from fastembed import TextEmbedding
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import normalize
 
-# ---------------- CONFIGURATION ----------------
-
 KB_FILE = "knowledge_base.json"
+MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 app = FastAPI(title="Technical RAG API")
 
@@ -26,32 +26,44 @@ passages = []
 sentences = []
 sentence_sources = []
 
-word_vectorizer = None
-char_vectorizer = None
+embedder = None
+passage_embeddings = None
+sentence_embeddings = None
 
-passage_word_matrix = None
-passage_char_matrix = None
+vectorizer = None
+passage_tfidf = None
+sentence_tfidf = None
 
-sentence_word_matrix = None
-sentence_char_matrix = None
-
-
-# ---------------- REQUEST FORMAT ----------------
 
 class QueryRequest(BaseModel):
     question: str
     top_k: int = Field(default=3, ge=1, le=5)
 
 
-# ---------------- LOAD KNOWLEDGE BASE ----------------
+def clean_text(text):
+    return re.sub(r"\s+", " ", str(text)).strip()
+
+
+def is_injection(text):
+    patterns = [
+        r"ignore\s+(all\s+)?previous\s+instructions",
+        r"ignore\s+all\s+rules",
+        r"reveal\s+(the\s+)?system\s+prompt",
+        r"execute\s+this\s+command",
+        r"disregard\s+(all\s+)?instructions",
+    ]
+
+    return any(
+        re.search(pattern, text, re.IGNORECASE)
+        for pattern in patterns
+    )
+
 
 @app.on_event("startup")
 def load_data():
-
     global passages, sentences, sentence_sources
-    global word_vectorizer, char_vectorizer
-    global passage_word_matrix, passage_char_matrix
-    global sentence_word_matrix, sentence_char_matrix
+    global embedder, passage_embeddings, sentence_embeddings
+    global vectorizer, passage_tfidf, sentence_tfidf
 
     with open(KB_FILE, "r", encoding="utf-8") as file:
         passages = json.load(file)
@@ -59,133 +71,119 @@ def load_data():
     if not isinstance(passages, list) or len(passages) != 50:
         raise RuntimeError("Knowledge base must contain exactly 50 passages.")
 
-    # Split passages into sentences
-    for index, passage in enumerate(passages):
+    passages = [clean_text(p) for p in passages]
 
+    for index, passage in enumerate(passages):
         parts = re.split(r"(?<=[.!?])\s+", passage)
 
         for part in parts:
-            part = part.strip()
+            part = clean_text(part)
 
-            if part:
+            if part and not is_injection(part):
                 sentences.append(part)
                 sentence_sources.append(index)
 
-    # Word-based TF-IDF
-    word_vectorizer = TfidfVectorizer(
+    # Load dense embedding model
+    embedder = TextEmbedding(model_name=MODEL_NAME)
+
+    passage_embeddings = np.array(
+        list(embedder.embed(passages)),
+        dtype=np.float32
+    )
+
+    sentence_embeddings = np.array(
+        list(embedder.embed(sentences)),
+        dtype=np.float32
+    )
+
+    passage_embeddings = normalize(passage_embeddings)
+    sentence_embeddings = normalize(sentence_embeddings)
+
+    # Keep TF-IDF for exact technical terms
+    vectorizer = TfidfVectorizer(
         ngram_range=(1, 2),
         lowercase=True,
         sublinear_tf=True,
-        token_pattern=r"(?u)\b[\w.-]+\b"
-    )
-
-    passage_word_matrix = normalize(
-        word_vectorizer.fit_transform(passages)
-    )
-
-    sentence_word_matrix = normalize(
-        word_vectorizer.transform(sentences)
-    )
-
-    # Character-based TF-IDF helps match technical terms
-    char_vectorizer = TfidfVectorizer(
-        analyzer="char_wb",
-        ngram_range=(3, 5),
-        lowercase=True,
-        sublinear_tf=True,
+        token_pattern=r"(?u)\b[\w.-]+\b",
         max_features=20000
     )
 
-    passage_char_matrix = normalize(
-        char_vectorizer.fit_transform(passages)
+    passage_tfidf = normalize(
+        vectorizer.fit_transform(passages)
     )
 
-    sentence_char_matrix = normalize(
-        char_vectorizer.transform(sentences)
+    sentence_tfidf = normalize(
+        vectorizer.transform(sentences)
     )
 
-
-# ---------------- RETRIEVAL ----------------
 
 def retrieve(question, top_k):
-
-    query_word = word_vectorizer.transform([question])
-    query_char = char_vectorizer.transform([question])
-
-    word_scores = (
-        passage_word_matrix @ query_word.T
-    ).toarray().flatten()
-
-    char_scores = (
-        passage_char_matrix @ query_char.T
-    ).toarray().flatten()
-
-    # Combine word and character similarity
-    final_scores = (
-        0.75 * word_scores +
-        0.25 * char_scores
+    query_embedding = np.array(
+        list(embedder.query_embed(question)),
+        dtype=np.float32
     )
 
-    ranked = np.argsort(-final_scores)[:top_k]
+    query_embedding = normalize(query_embedding)
 
-    return ranked, final_scores, query_word, query_char
+    dense_scores = (
+        passage_embeddings @ query_embedding.T
+    ).flatten()
 
+    query_sparse = vectorizer.transform([question])
 
-# ---------------- ANSWER EXTRACTION ----------------
-
-def extract_answer(query_word, query_char, ranked_indices):
-
-    word_scores = (
-        sentence_word_matrix @ query_word.T
+    lexical_scores = (
+        passage_tfidf @ query_sparse.T
     ).toarray().flatten()
 
-    char_scores = (
-        sentence_char_matrix @ query_char.T
+    scores = (
+        0.75 * dense_scores +
+        0.25 * lexical_scores
+    )
+
+    ranked = np.argsort(-scores)[:top_k]
+
+    return ranked, scores, query_embedding, query_sparse
+
+
+def extract_evidence(query_embedding, query_sparse, ranked):
+    dense_sentence_scores = (
+        sentence_embeddings @ query_embedding.T
+    ).flatten()
+
+    lexical_sentence_scores = (
+        sentence_tfidf @ query_sparse.T
     ).toarray().flatten()
 
     sentence_scores = (
-        0.75 * word_scores +
-        0.25 * char_scores
+        0.75 * dense_sentence_scores +
+        0.25 * lexical_sentence_scores
     )
 
     evidence = []
     used_sources = set()
 
-    for passage_index in ranked_indices:
-
+    for passage_index in ranked:
         candidates = []
 
-        for i, source_index in enumerate(sentence_sources):
-
-            if source_index != passage_index:
+        for i, source in enumerate(sentence_sources):
+            if source != passage_index:
                 continue
 
             sentence = sentences[i]
 
-            # Do not return sentences containing suspicious instructions
-            if re.search(
-                r"ignore previous instructions|reveal system prompt|"
-                r"execute this command|ignore all rules",
-                sentence,
-                re.IGNORECASE
-            ):
+            if is_injection(sentence):
                 continue
 
             candidates.append((sentence_scores[i], sentence))
 
         candidates.sort(key=lambda x: x[0], reverse=True)
 
-        if candidates and candidates[0][0] >= 0.10:
-
-            best_score, best_sentence = candidates[0]
-
-            evidence.append(best_sentence)
+        if candidates and candidates[0][0] >= 0.30:
+            evidence.append(candidates[0][1])
             used_sources.add(int(passage_index))
 
     return evidence, used_sources
 
-
-# ---------------- API ENDPOINTS ----------------
 
 @app.get("/")
 def home():
@@ -196,16 +194,16 @@ def home():
 def health():
     return {
         "status": "ok",
-        "passages": len(passages)
+        "passages": len(passages),
+        "embedding_model": MODEL_NAME
     }
 
 
 @app.post("/query")
 def query(request: QueryRequest):
+    question = clean_text(request.question)
 
-    question = request.question.strip()
-
-    if not question:
+    if not question or is_injection(question):
         return {
             "answer": None,
             "sources": [],
@@ -213,16 +211,15 @@ def query(request: QueryRequest):
             "confidence": 0.1
         }
 
-    indices, combined, query_word, query_char = retrieve(
+    ranked, scores, query_embedding, query_sparse = retrieve(
         question,
         request.top_k
     )
 
-    best_score = float(combined[indices[0]])
+    best_score = float(scores[ranked[0]])
 
-    # Abstain if retrieval relevance is too low
-    if best_score < 0.12:
-
+    # Conservative abstention
+    if best_score < 0.35:
         return {
             "answer": None,
             "sources": [],
@@ -230,14 +227,13 @@ def query(request: QueryRequest):
             "confidence": 0.2
         }
 
-    evidence, used_sources = extract_answer(
-        query_word,
-        query_char,
-        indices
+    evidence, used_sources = extract_evidence(
+        query_embedding,
+        query_sparse,
+        ranked
     )
 
     if not evidence:
-
         return {
             "answer": None,
             "sources": [],
@@ -245,27 +241,26 @@ def query(request: QueryRequest):
             "confidence": 0.2
         }
 
-    # Keep sources in descending retrieval order
     sources = [
-        int(i) for i in indices
+        int(i) for i in ranked
         if int(i) in used_sources
-    ]
-
-    scores = [
-        round(float(np.clip(combined[i], 0, 1)), 4)
-        for i in sources
     ]
 
     answer = " ".join(evidence)
 
+    output_scores = [
+        round(float(np.clip(scores[i], 0, 1)), 4)
+        for i in sources
+    ]
+
     confidence = min(
         0.95,
-        max(0.62, 0.62 + best_score * 0.5)
+        max(0.62, 0.62 + best_score * 0.35)
     )
 
     return {
         "answer": answer,
         "sources": sources,
-        "scores": scores,
+        "scores": output_scores,
         "confidence": round(confidence, 4)
     }
