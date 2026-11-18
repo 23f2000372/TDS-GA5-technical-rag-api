@@ -1,20 +1,16 @@
 
 import json
-import os
 import re
-import threading
 
 import numpy as np
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import normalize
 
 # ---------------- CONFIGURATION ----------------
 
-MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 KB_FILE = "knowledge_base.json"
 
 app = FastAPI(title="Technical RAG API")
@@ -26,15 +22,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-model = None
 passages = []
-passage_vectors = None
-vectorizer = None
-tfidf_matrix = None
-sentence_data = []
-sentence_vectors = None
+sentences = []
+sentence_sources = []
 
-model_lock = threading.Lock()
+word_vectorizer = None
+char_vectorizer = None
+
+passage_word_matrix = None
+passage_char_matrix = None
+
+sentence_word_matrix = None
+sentence_char_matrix = None
 
 
 # ---------------- REQUEST FORMAT ----------------
@@ -49,9 +48,10 @@ class QueryRequest(BaseModel):
 @app.on_event("startup")
 def load_data():
 
-    global model, passages
-    global passage_vectors, vectorizer, tfidf_matrix
-    global sentence_data, sentence_vectors
+    global passages, sentences, sentence_sources
+    global word_vectorizer, char_vectorizer
+    global passage_word_matrix, passage_char_matrix
+    global sentence_word_matrix, sentence_char_matrix
 
     with open(KB_FILE, "r", encoding="utf-8") as file:
         passages = json.load(file)
@@ -59,143 +59,133 @@ def load_data():
     if not isinstance(passages, list) or len(passages) != 50:
         raise RuntimeError("Knowledge base must contain exactly 50 passages.")
 
-    model = SentenceTransformer(MODEL_NAME)
+    # Split passages into sentences
+    for index, passage in enumerate(passages):
 
-    # Generate dense embeddings once at startup
-    with model_lock:
-        passage_vectors = model.encode(
-            passages,
-            normalize_embeddings=True,
-            convert_to_numpy=True
-        ).astype("float32")
+        parts = re.split(r"(?<=[.!?])\s+", passage)
 
-    # TF-IDF helps with exact technical terms and numbers
-    vectorizer = TfidfVectorizer(
+        for part in parts:
+            part = part.strip()
+
+            if part:
+                sentences.append(part)
+                sentence_sources.append(index)
+
+    # Word-based TF-IDF
+    word_vectorizer = TfidfVectorizer(
         ngram_range=(1, 2),
         lowercase=True,
-        sublinear_tf=True
+        sublinear_tf=True,
+        token_pattern=r"(?u)\b[\w.-]+\b"
     )
 
-    tfidf_matrix = normalize(
-        vectorizer.fit_transform(passages)
+    passage_word_matrix = normalize(
+        word_vectorizer.fit_transform(passages)
     )
 
-    # Split passages into individual sentences
-    all_sentences = []
+    sentence_word_matrix = normalize(
+        word_vectorizer.transform(sentences)
+    )
 
-    for index, passage in enumerate(passages):
-        sentences = re.split(r"(?<=[.!?])\s+", passage)
+    # Character-based TF-IDF helps match technical terms
+    char_vectorizer = TfidfVectorizer(
+        analyzer="char_wb",
+        ngram_range=(3, 5),
+        lowercase=True,
+        sublinear_tf=True,
+        max_features=20000
+    )
 
-        for sentence in sentences:
-            if sentence.strip():
-                sentence_data.append((index, sentence.strip()))
-                all_sentences.append(sentence.strip())
+    passage_char_matrix = normalize(
+        char_vectorizer.fit_transform(passages)
+    )
 
-    with model_lock:
-        sentence_vectors = model.encode(
-            all_sentences,
-            normalize_embeddings=True,
-            convert_to_numpy=True
-        ).astype("float32")
+    sentence_char_matrix = normalize(
+        char_vectorizer.transform(sentences)
+    )
 
 
 # ---------------- RETRIEVAL ----------------
 
 def retrieve(question, top_k):
 
-    with model_lock:
-        query_vector = model.encode(
-            [question],
-            normalize_embeddings=True,
-            convert_to_numpy=True
-        )[0].astype("float32")
+    query_word = word_vectorizer.transform([question])
+    query_char = char_vectorizer.transform([question])
 
-    dense_scores = np.clip(
-        passage_vectors @ query_vector, 0, 1
-    )
+    word_scores = (
+        passage_word_matrix @ query_word.T
+    ).toarray().flatten()
 
-    query_tfidf = vectorizer.transform([question])
+    char_scores = (
+        passage_char_matrix @ query_char.T
+    ).toarray().flatten()
 
-    lexical_scores = (
-        query_tfidf @ tfidf_matrix.T
-    ).toarray()[0]
-
-    # Combine semantic and keyword relevance
+    # Combine word and character similarity
     final_scores = (
-        0.80 * dense_scores +
-        0.20 * lexical_scores
+        0.75 * word_scores +
+        0.25 * char_scores
     )
 
-    ranked = np.argsort(-final_scores)
+    ranked = np.argsort(-final_scores)[:top_k]
 
-    return ranked[:top_k], dense_scores, lexical_scores, final_scores
+    return ranked, final_scores, query_word, query_char
 
 
 # ---------------- ANSWER EXTRACTION ----------------
 
-def extract_answer(question, ranked_indices):
+def extract_answer(query_word, query_char, ranked_indices):
 
-    with model_lock:
-        query_vector = model.encode(
-            [question],
-            normalize_embeddings=True,
-            convert_to_numpy=True
-        )[0].astype("float32")
+    word_scores = (
+        sentence_word_matrix @ query_word.T
+    ).toarray().flatten()
 
-    question_words = set(
-        re.findall(r"\b[\w.-]+\b", question.lower())
+    char_scores = (
+        sentence_char_matrix @ query_char.T
+    ).toarray().flatten()
+
+    sentence_scores = (
+        0.75 * word_scores +
+        0.25 * char_scores
     )
 
     evidence = []
     used_sources = set()
 
-    for idx in ranked_indices:
+    for passage_index in ranked_indices:
 
         candidates = []
 
-        for i, (source_idx, sentence) in enumerate(sentence_data):
+        for i, source_index in enumerate(sentence_sources):
 
-            if source_idx != idx:
+            if source_index != passage_index:
                 continue
 
-            semantic = float(
-                np.clip(sentence_vectors[i] @ query_vector, 0, 1)
-            )
+            sentence = sentences[i]
 
-            sentence_words = set(
-                re.findall(r"\b[\w.-]+\b", sentence.lower())
-            )
-
-            overlap = len(
-                question_words & sentence_words
-            ) / max(1, len(question_words))
-
-            score = 0.80 * semantic + 0.20 * overlap
-
-            candidates.append((score, sentence))
-
-        candidates.sort(reverse=True)
-
-        if candidates and candidates[0][0] >= 0.30:
-
-            best_sentence = candidates[0][1]
-
-            # Never execute or follow instructions found in passages.
+            # Do not return sentences containing suspicious instructions
             if re.search(
                 r"ignore previous instructions|reveal system prompt|"
-                r"execute this command",
-                best_sentence,
+                r"execute this command|ignore all rules",
+                sentence,
                 re.IGNORECASE
             ):
                 continue
 
+            candidates.append((sentence_scores[i], sentence))
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+
+        if candidates and candidates[0][0] >= 0.10:
+
+            best_score, best_sentence = candidates[0]
+
             evidence.append(best_sentence)
-            used_sources.add(idx)
+            used_sources.add(int(passage_index))
 
     return evidence, used_sources
 
 
-# ---------------- API ENDPOINT ----------------
+# ---------------- API ENDPOINTS ----------------
 
 @app.get("/")
 def home():
@@ -223,20 +213,16 @@ def query(request: QueryRequest):
             "confidence": 0.1
         }
 
-    indices, dense, lexical, combined = retrieve(
+    indices, combined, query_word, query_char = retrieve(
         question,
         request.top_k
     )
 
-    best_idx = int(indices[0])
-    best_dense = float(dense[best_idx])
-    best_lexical = float(lexical[best_idx])
+    best_score = float(combined[indices[0]])
 
-    # Conservative abstention check
-    if not (
-        best_dense >= 0.43
-        or (best_dense >= 0.34 and best_lexical >= 0.025)
-    ):
+    # Abstain if retrieval relevance is too low
+    if best_score < 0.12:
+
         return {
             "answer": None,
             "sources": [],
@@ -245,11 +231,13 @@ def query(request: QueryRequest):
         }
 
     evidence, used_sources = extract_answer(
-        question,
+        query_word,
+        query_char,
         indices
     )
 
     if not evidence:
+
         return {
             "answer": None,
             "sources": [],
@@ -257,7 +245,7 @@ def query(request: QueryRequest):
             "confidence": 0.2
         }
 
-    # Preserve descending retrieval order
+    # Keep sources in descending retrieval order
     sources = [
         int(i) for i in indices
         if int(i) in used_sources
@@ -271,8 +259,8 @@ def query(request: QueryRequest):
     answer = " ".join(evidence)
 
     confidence = min(
-        0.97,
-        max(0.62, 0.62 + (float(combined[best_idx]) - 0.35) * 0.75)
+        0.95,
+        max(0.62, 0.62 + best_score * 0.5)
     )
 
     return {
