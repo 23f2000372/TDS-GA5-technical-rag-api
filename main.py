@@ -6,7 +6,7 @@ import numpy as np
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from fastembed import TextEmbedding
+
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import normalize
 
@@ -14,7 +14,6 @@ from sklearn.preprocessing import normalize
 # ---------------- CONFIGURATION ----------------
 
 KB_FILE = "knowledge_base.json"
-MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 app = FastAPI(title="Technical RAG API")
 
@@ -29,86 +28,101 @@ passages = []
 sentences = []
 sentence_sources = []
 
-embedder = None
+word_vectorizer = None
+char_vectorizer = None
 
-passage_embeddings = None
-sentence_embeddings = None
+passage_word_matrix = None
+passage_char_matrix = None
 
-vectorizer = None
-passage_tfidf = None
-sentence_tfidf = None
+sentence_word_matrix = None
+sentence_char_matrix = None
 
 
-# ---------------- TECHNICAL ENTITIES ----------------
+# ---------------- REQUEST FORMAT ----------------
 
-ENTITY_ALIASES = {
-    "postgresql": ["postgresql", "postgres", "pgsql"],
-    "redis": ["redis"],
-    "mysql": ["mysql"],
-    "mongodb": ["mongodb", "mongo"],
-    "cassandra": ["cassandra"],
+class QueryRequest(BaseModel):
+    question: str
+    top_k: int = Field(default=3, ge=1, le=5)
 
-    "raft": ["raft"],
-    "paxos": ["paxos", "multi-paxos", "multipaxos"],
 
+# ---------------- ENTITY ALIASES ----------------
+
+ENTITY_GROUPS = {
+    "raft": ["raft", "etcd"],
+    "paxos": ["paxos", "multi-paxos", "zookeeper", "chubby"],
+    "gossip": ["gossip", "epidemic gossip", "cassandra gossip"],
+    "swim": ["swim", "consul"],
+    "two phase commit": ["two-phase commit", "2pc", "two phase commit"],
+    "three phase commit": ["three-phase commit", "3pc", "three phase commit"],
+    "saga": ["saga", "cadence"],
+    "consistent hashing": ["consistent hashing", "dynamo"],
+    "rendezvous hashing": ["rendezvous hashing", "highest random weight"],
+    "vector clocks": ["vector clock", "vector clocks", "riak"],
+    "hybrid logical clocks": ["hybrid logical clock", "hlc"],
     "sgd": ["sgd", "stochastic gradient descent"],
     "adamw": ["adamw", "adam w"],
-    "adam": ["adam optimizer"],
-    "layer normalization": ["layer normalization", "layernorm"],
-
-    "mvcc": ["mvcc", "multi-version concurrency control"],
-    "undo logs": ["undo log", "undo logs"],
-
+    "transformer encoder": ["transformer encoder", "self-attention"],
+    "transformer decoder": ["transformer decoder", "autoregressive decoder", "llama"],
+    "logistic regression": ["logistic regression"],
+    "svm": ["svm", "support vector machine"],
+    "mlp": ["mlp", "multi-layer perceptron", "multilayer perceptron"],
+    "resnet": ["resnet", "residual convolutional network"],
+    "batch normalization": ["batch normalization", "batch norm"],
+    "layer normalization": ["layer normalization", "layer norm"],
+    "postgresql": ["postgresql", "postgres", "pgbouncer"],
+    "mysql": ["mysql", "innodb"],
+    "b tree": ["b+ tree", "b tree", "clustered index"],
+    "lsm tree": ["lsm tree", "log-structured merge tree", "rocksdb"],
+    "mongodb": ["mongodb", "wiredtiger"],
+    "cassandra": ["apache cassandra", "cassandra", "cql"],
+    "redis": ["redis"],
+    "memcached": ["memcached"],
+    "wal": ["write-ahead log", "write ahead log", "wal", "aries"],
+    "shadow paging": ["shadow paging", "sqlite"],
     "tcp": ["tcp", "transmission control protocol"],
-    "udp": ["udp", "user datagram protocol"],
+    "quic": ["quic", "http/3"],
     "dns": ["dns", "domain name system"],
+    "mdns": ["mdns", "multicast dns", "bonjour", "avahi"],
+    "http2": ["http/2", "http2", "hpack"],
+    "http3": ["http/3", "http3", "qpack"],
+    "tls13": ["tls 1.3", "tls 1.3 handshake"],
+    "tls12": ["tls 1.2", "tls 1.2 handshake"],
     "bgp": ["bgp", "border gateway protocol"],
-    "ospf": ["ospf"],
-
-    "tls": ["tls", "transport layer security"],
-    "ssl": ["ssl"],
+    "ospf": ["ospf", "open shortest path first"],
     "rsa": ["rsa"],
-    "aes": ["aes"],
-    "sha": ["sha", "sha-256", "sha256"],
+    "ecc": ["elliptic curve cryptography", "ecc", "ecdsa"],
+    "password hashing": ["password hashing", "argon2", "pbkdf2", "blake2"],
+    "waf": ["web application firewall", "waf"],
+    "api gateway": ["api gateway", "token bucket", "kong"],
+    "aes": ["aes", "advanced encryption standard"],
+    "chacha": ["chacha20", "poly1305"],
+    "oauth": ["oauth", "pkce", "proof key for code exchange"],
+    "jwt": ["jwt", "json web token"],
 }
 
 
-def clean_text(text):
-    return re.sub(r"\s+", " ", str(text)).strip()
-
-
-def contains_phrase(text, phrase):
-    pattern = r"(?<![a-z0-9])" + re.escape(phrase.lower()) + r"(?![a-z0-9])"
-    return bool(re.search(pattern, text.lower()))
+def normalize_text(text):
+    text = text.lower()
+    text = text.replace("-", " ")
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def find_entities(text):
+    text = normalize_text(text)
     found = []
 
-    for entity, aliases in ENTITY_ALIASES.items():
-        if any(contains_phrase(text, alias) for alias in aliases):
-            found.append(entity)
+    for entity, aliases in ENTITY_GROUPS.items():
+        for alias in aliases:
+            alias = normalize_text(alias)
+
+            if re.search(
+                r"(?<!\w)" + re.escape(alias) + r"(?!\w)",
+                text
+            ):
+                found.append(entity)
+                break
 
     return found
-
-
-# ---------------- PROMPT INJECTION FILTER ----------------
-
-def is_injection(text):
-    patterns = [
-        r"ignore\s+(all\s+)?previous\s+instructions",
-        r"ignore\s+all\s+rules",
-        r"reveal\s+(the\s+)?system\s+prompt",
-        r"execute\s+this\s+command",
-        r"disregard\s+(all\s+)?instructions",
-        r"override\s+(the\s+)?system",
-        r"ignore\s+the\s+above",
-    ]
-
-    return any(
-        re.search(pattern, text, re.IGNORECASE)
-        for pattern in patterns
-    )
 
 
 # ---------------- LOAD KNOWLEDGE BASE ----------------
@@ -117,8 +131,9 @@ def is_injection(text):
 def load_data():
 
     global passages, sentences, sentence_sources
-    global embedder, passage_embeddings, sentence_embeddings
-    global vectorizer, passage_tfidf, sentence_tfidf
+    global word_vectorizer, char_vectorizer
+    global passage_word_matrix, passage_char_matrix
+    global sentence_word_matrix, sentence_char_matrix
 
     with open(KB_FILE, "r", encoding="utf-8") as file:
         passages = json.load(file)
@@ -126,54 +141,54 @@ def load_data():
     if not isinstance(passages, list) or len(passages) != 50:
         raise RuntimeError("Knowledge base must contain exactly 50 passages.")
 
-    passages = [clean_text(p) for p in passages]
-
-    sentences.clear()
-    sentence_sources.clear()
+    sentences = []
+    sentence_sources = []
 
     for index, passage in enumerate(passages):
 
         parts = re.split(r"(?<=[.!?])\s+", passage)
 
         for part in parts:
+            part = part.strip()
 
-            part = clean_text(part)
-
-            if part and not is_injection(part):
+            if part:
                 sentences.append(part)
                 sentence_sources.append(index)
 
-    # Dense semantic embeddings
-    embedder = TextEmbedding(model_name=MODEL_NAME)
+    # Word TF-IDF
 
-    passage_embeddings = np.array(
-        list(embedder.embed(passages)),
-        dtype=np.float32
-    )
-
-    sentence_embeddings = np.array(
-        list(embedder.embed(sentences)),
-        dtype=np.float32
-    )
-
-    passage_embeddings = normalize(passage_embeddings)
-    sentence_embeddings = normalize(sentence_embeddings)
-
-    # Lexical retrieval
-    vectorizer = TfidfVectorizer(
+    word_vectorizer = TfidfVectorizer(
         ngram_range=(1, 2),
         lowercase=True,
         sublinear_tf=True,
-        token_pattern=r"(?u)\b[\w.-]+\b",
+        stop_words="english",
+        token_pattern=r"(?u)\b[\w.-]+\b"
+    )
+
+    passage_word_matrix = normalize(
+        word_vectorizer.fit_transform(passages)
+    )
+
+    sentence_word_matrix = normalize(
+        word_vectorizer.transform(sentences)
+    )
+
+    # Character TF-IDF
+
+    char_vectorizer = TfidfVectorizer(
+        analyzer="char_wb",
+        ngram_range=(3, 5),
+        lowercase=True,
+        sublinear_tf=True,
         max_features=20000
     )
 
-    passage_tfidf = normalize(
-        vectorizer.fit_transform(passages)
+    passage_char_matrix = normalize(
+        char_vectorizer.fit_transform(passages)
     )
 
-    sentence_tfidf = normalize(
-        vectorizer.transform(sentences)
+    sentence_char_matrix = normalize(
+        char_vectorizer.transform(sentences)
     )
 
 
@@ -181,32 +196,27 @@ def load_data():
 
 def retrieve(question, top_k):
 
-    query_embedding = np.array(
-        list(embedder.query_embed(question)),
-        dtype=np.float32
-    )
+    query_word = word_vectorizer.transform([question])
+    query_char = char_vectorizer.transform([question])
 
-    query_embedding = normalize(query_embedding)
-
-    query_sparse = vectorizer.transform([question])
-
-    dense_scores = (
-        passage_embeddings @ query_embedding.T
-    ).flatten()
-
-    lexical_scores = (
-        passage_tfidf @ query_sparse.T
+    word_scores = (
+        passage_word_matrix @ query_word.T
     ).toarray().flatten()
 
-    # Hybrid retrieval
+    char_scores = (
+        passage_char_matrix @ query_char.T
+    ).toarray().flatten()
+
     scores = (
-        0.70 * dense_scores +
-        0.30 * lexical_scores
+        0.70 * word_scores +
+        0.30 * char_scores
     )
 
     query_entities = find_entities(question)
 
-    # Entity-aware relevance boost
+    # Give a strong preference to passages containing
+    # the exact entity asked about.
+
     if query_entities:
 
         for i, passage in enumerate(passages):
@@ -216,50 +226,79 @@ def retrieve(question, top_k):
             matching = set(query_entities) & set(passage_entities)
 
             if matching:
-                scores[i] += 0.12 * (
+                scores[i] += 0.22 * (
                     len(matching) / len(query_entities)
                 )
 
-    scores = np.clip(scores, 0, 1)
+    ranked = np.argsort(-scores)
 
-    # For comparisons, retrieve enough passages to find both sides
-    number_to_retrieve = min(
-        len(passages),
-        max(top_k, 10 if len(query_entities) >= 2 else 5)
-    )
+    # For comparison questions, make sure that passages
+    # for all requested entities can be considered.
 
-    ranked = np.argsort(-scores)[:number_to_retrieve]
+    if query_entities:
 
-    return ranked, scores, query_embedding, query_sparse, query_entities
+        selected = []
+
+        for entity in query_entities:
+
+            for i in ranked:
+
+                if entity in find_entities(passages[i]):
+                    if int(i) not in selected:
+                        selected.append(int(i))
+                    break
+
+        for i in ranked:
+
+            if int(i) not in selected:
+                selected.append(int(i))
+
+        ranked = np.array(selected)
+
+    return ranked[:max(top_k, len(query_entities))], scores, query_word, query_char, query_entities
 
 
-# ---------------- EVIDENCE EXTRACTION ----------------
+# ---------------- ANSWER EXTRACTION ----------------
 
-def extract_evidence(
-    query_embedding,
-    query_sparse,
-    ranked,
+INJECTION_PATTERN = re.compile(
+    r"ignore previous instructions|"
+    r"reveal system prompt|"
+    r"execute this command|"
+    r"ignore all rules|"
+    r"disregard previous instructions",
+    re.IGNORECASE
+)
+
+
+def extract_answer(
+    question,
+    query_word,
+    query_char,
+    ranked_indices,
     query_entities
 ):
 
-    dense_scores = (
-        sentence_embeddings @ query_embedding.T
-    ).flatten()
+    word_scores = (
+        sentence_word_matrix @ query_word.T
+    ).toarray().flatten()
 
-    lexical_scores = (
-        sentence_tfidf @ query_sparse.T
+    char_scores = (
+        sentence_char_matrix @ query_char.T
     ).toarray().flatten()
 
     sentence_scores = (
-        0.70 * dense_scores +
-        0.30 * lexical_scores
+        0.70 * word_scores +
+        0.30 * char_scores
+    )
+
+    question_words = set(
+        re.findall(r"[a-z0-9]+", normalize_text(question))
     )
 
     evidence = []
-    selected_sources = []
-    used_sentences = set()
+    used_sources = []
 
-    for passage_index in ranked:
+    for passage_index in ranked_indices:
 
         passage = passages[int(passage_index)]
         passage_entities = find_entities(passage)
@@ -268,99 +307,97 @@ def extract_evidence(
             set(query_entities) & set(passage_entities)
         )
 
-        # If question names specific entities, avoid unrelated passages
+        # When entities are specified, do not use an
+        # unrelated passage as evidence.
+
         if query_entities and not matching_entities:
             continue
 
         candidates = []
 
-        for i, source in enumerate(sentence_sources):
+        for i, source_index in enumerate(sentence_sources):
 
-            if source != passage_index:
+            if source_index != passage_index:
                 continue
 
             sentence = sentences[i]
 
-            if is_injection(sentence):
+            if INJECTION_PATTERN.search(sentence):
                 continue
-
-            score = float(sentence_scores[i])
 
             sentence_entities = find_entities(sentence)
 
-            # Reward sentences that mention the requested entities
-            if query_entities:
+            entity_match = (
+                bool(set(query_entities) & set(sentence_entities))
+                if query_entities else False
+            )
 
-                sentence_matches = (
-                    set(query_entities) & set(sentence_entities)
-                )
+            sentence_words = set(
+                re.findall(r"[a-z0-9]+", normalize_text(sentence))
+            )
 
-                score += 0.12 * (
-                    len(sentence_matches) / len(query_entities)
-                )
+            overlap = len(question_words & sentence_words)
 
-                # Keep sentence context from a passage
-                # that contains the requested entity.
-                if not sentence_matches and not matching_entities:
-                    continue
+            score = float(sentence_scores[i])
 
-            candidates.append((score, i, sentence))
+            # Prefer sentences that mention the requested entity.
+
+            if entity_match:
+                score += 0.30
+
+            # Prefer sentences that contain specific query terms.
+
+            score += min(overlap * 0.015, 0.12)
+
+            candidates.append((score, sentence, entity_match))
 
         candidates.sort(key=lambda x: x[0], reverse=True)
 
-        # Select up to two useful sentences per passage
-        count = 0
+        selected = []
 
-        for score, sentence_index, sentence in candidates:
+        for score, sentence, entity_match in candidates:
 
-            if count >= 2:
+            if score < 0.08:
+                continue
+
+            # Avoid unrelated sentences in entity-based questions.
+            if query_entities and not entity_match:
+                continue
+
+            selected.append(sentence)
+
+            if len(selected) >= 2:
                 break
 
-            if score < 0.25:
-                continue
+        if selected:
 
-            if sentence_index in used_sentences:
-                continue
+            evidence.extend(selected)
+            used_sources.append(int(passage_index))
 
-            evidence.append(sentence)
-            selected_sources.append(int(passage_index))
-            used_sentences.add(sentence_index)
-
-            count += 1
-
-    return evidence, selected_sources
+    return evidence, used_sources
 
 
 # ---------------- API ENDPOINTS ----------------
 
 @app.get("/")
 def home():
-    return {
-        "status": "RAG API is running"
-    }
+    return {"status": "RAG API is running"}
 
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "passages": len(passages),
-        "embedding_model": MODEL_NAME
+        "passages": len(passages)
     }
 
-from pydantic import BaseModel
 
-class QueryRequest(BaseModel):
-    question: str
-    top_k: int = 3
-    
 @app.post("/query")
 def query(request: QueryRequest):
 
-    question = clean_text(request.question)
+    question = request.question.strip()
 
-    if not question or is_injection(question):
-
+    if not question:
         return {
             "answer": None,
             "sources": [],
@@ -368,14 +405,16 @@ def query(request: QueryRequest):
             "confidence": 0.1
         }
 
-    ranked, scores, query_embedding, query_sparse, query_entities = (
-        retrieve(question, request.top_k)
+    indices, combined, query_word, query_char, query_entities = retrieve(
+        question,
+        request.top_k
     )
 
-    best_score = float(scores[ranked[0]])
+    best_score = float(combined[indices[0]])
 
-    # Abstain on weak retrieval
-    if best_score < 0.35:
+    # Abstain on clearly unrelated questions.
+
+    if best_score < 0.10:
 
         return {
             "answer": None,
@@ -384,14 +423,15 @@ def query(request: QueryRequest):
             "confidence": 0.2
         }
 
-    evidence, evidence_sources = extract_evidence(
-        query_embedding,
-        query_sparse,
-        ranked,
+    evidence, used_sources = extract_answer(
+        question,
+        query_word,
+        query_char,
+        indices,
         query_entities
     )
 
-    if not evidence:
+    if not evidence or not used_sources:
 
         return {
             "answer": None,
@@ -400,31 +440,49 @@ def query(request: QueryRequest):
             "confidence": 0.2
         }
 
-    # Keep source indices unique and in descending retrieval order
-    source_set = set(evidence_sources)
+    # Keep no more than requested number of unique sources.
+
+    used_sources = used_sources[:request.top_k]
 
     sources = [
-        int(i) for i in ranked
-        if int(i) in source_set
+        i for i in used_sources
     ]
 
-    # Preserve evidence order while avoiding duplicate sentences
-    answer = " ".join(dict.fromkeys(evidence))
-
-    output_scores = [
-        round(float(np.clip(scores[i], 0, 1)), 4)
+    scores = [
+        round(float(np.clip(combined[i], 0, 1)), 4)
         for i in sources
     ]
 
-    # Confidence based on retrieval strength
+    # Keep evidence only from returned sources.
+
+    allowed_sources = set(sources)
+
+    final_evidence = []
+
+    for sentence, source_index in zip(
+        evidence,
+        [
+            source for source in used_sources
+            for _ in range(2)
+        ]
+    ):
+
+        if source_index in allowed_sources:
+            final_evidence.append(sentence)
+
+    answer = " ".join(final_evidence)
+
+    if not answer:
+        answer = " ".join(evidence)
+
     confidence = min(
         0.95,
-        max(0.62, 0.62 + best_score * 0.30)
+        max(0.40, 0.45 + best_score * 0.65)
     )
 
     return {
         "answer": answer,
         "sources": sources,
-        "scores": output_scores,
+        "scores": scores,
         "confidence": round(confidence, 4)
     }
