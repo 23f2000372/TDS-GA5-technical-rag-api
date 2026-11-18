@@ -391,7 +391,12 @@ def health():
         "passages": len(passages)
     }
 
+from pydantic import BaseModel
 
+class QueryRequest(BaseModel):
+    question: str
+    top_k: int = 3
+    
 @app.post("/query")
 def query(request: QueryRequest):
 
