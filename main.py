@@ -348,7 +348,12 @@ def health():
         "embedding_model": MODEL_NAME
     }
 
+from pydantic import BaseModel
 
+class QueryRequest(BaseModel):
+    question: str
+    top_k: int = 3
+    
 @app.post("/query")
 def query(request: QueryRequest):
 
